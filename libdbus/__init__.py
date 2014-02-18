@@ -1,5 +1,9 @@
+import os
 import weakref
 import ctypes
+from cStringIO import StringIO
+import xml.dom.minidom
+
 
 dbus = ctypes.CDLL('libdbus-1.so.3')
 
@@ -20,6 +24,170 @@ DBUS_INTROSPECT_1_0_XML_DOCTYPE_DECL_NODE = \
     '\n"http://www.freedesktop.org/standards/dbus/1.0/introspect.dtd">\n'
 
 
+def export(func):
+    setattr(func, '_dbus_allow_export', True)
+    return func
+
+
+def is_exported(func):
+    return hasattr(func, '_dbus_allow_export') and \
+        getattr(func, '_dbus_allow_export')
+
+
+def object_interfaces(dbus_object):
+    if isinstance(dbus_object, DBusObject):
+        cls = type(dbus_object)
+    elif issubclass(dbus_object, DBusObject):
+        cls = dbus_object
+    else:
+        raise TypeError('must be a DBusObject instance of subclass')
+    interfaces = list()
+    for type_ in cls.mro():
+        if hasattr(type_, '_dbus_interfaces'):
+            interfaces.extend(type_._dbus_interfaces)
+    return list(set(interfaces))
+
+
+def typespec_len(argspec):
+    if set(argspec) - set('s'):
+        raise Exception('NotImplemented: %r' % (argspec, ))
+    return len(argspec)
+
+
+class DBusInterface(object):
+    def __init__(self, name):
+        self._members = list()
+        self.name = name
+
+    def get_argspec(self, methname):
+        for member in self._members:
+            if member[1] == methname:
+                return member[2]
+        else:
+            raise KeyError('no methname {!r}'.format(methname))
+
+    def get_retspec(self, methname):
+        for member in self._members:
+            if member[1] == methname:
+                return member[4]
+        else:
+            raise KeyError('no methname {!r}'.format(methname))
+
+    def add_method(self, name, argspec, argnames, retspec):
+        assert typespec_len(argspec) == len(argnames)
+        self._members.append(('method', name, argspec, argnames, retspec))
+
+    def add_signal(self, name, retspec):
+        self._members.append(('signal', name, retspec))
+
+    def astype(self):
+        return type(self.name, (DBusObject, ), {
+            '_dbus_interfaces': [self]
+        })
+
+
+dbus_introspectable = DBusInterface('org.freedesktop.DBus.Introspectable')
+dbus_introspectable.add_method('Introspect', '', [], 's')
+
+dbus_peer = DBusInterface('org.freedesktop.DBus.Peer')
+dbus_peer.add_method('Ping', '', [], '')
+dbus_peer.add_method('GetMachineId', '', [], 's')
+
+
+class DBusObject(dict):
+    _dbus_interfaces = [
+        dbus_introspectable,
+        dbus_peer
+    ]
+
+    @export
+    def Introspect(self):
+        return introspect_object(self, True)
+
+    def dbus_children(self):
+        return dict.keys(self)
+
+    def __repr__(self):
+        return "DBusObject({})".format(
+            super(DBusObject, self).__repr__()
+        )
+
+
+# class DBusObjectDescriptor(object):
+#     @classmethod
+#     def from_dbus_object(cls, dbus_object):
+#         inst = cls()
+#         inst._children.extend(list(dbus_object.keys()))
+#         inst._interfaces.extend(object_interfaces(dbus_object))
+#         return inst
+
+#     def __init__(self, *args, **kwargs):
+#         super(DBusObjectDescriptor, self).__init__(*args, **kwargs)
+#         self._children = list()
+#         self._interfaces = list()
+
+#     def add_interface(self, interface):
+#         self._interfaces.append(interface)
+
+
+def introspect_child_node_name_writer(writer, child_name):
+    writer.write('<node name="{}"/>'.format(child_name))
+
+
+def introspect_interface_method_writer(writer, member):
+    (type_, name, argspec, argnames, retspec) = member
+    assert type_ == 'method'
+    if argspec + retspec:
+        writer.write('<method name="{}">'.format(name))
+        in_arg_fmt = '<arg direction="in" type="{}" name="{}"/>'
+        for arg_type, name in zip(argspec, argnames):
+            writer.write(in_arg_fmt.format(arg_type, name))
+        ret_fmt = '<arg direction="out" type="{}"/>'
+        for ret in retspec:
+            writer.write(ret_fmt.format(ret))
+        writer.write('</method>')
+    else:
+        writer.write('<method name="{}"/>'.format(name))
+
+
+def introspect_interface_signal_writer(writer, member):
+    (type_, name, retspec) = member
+    assert type_ == 'signal'
+    raise NotImplemented
+
+
+def introspect_interface_writer(writer, dbus_interface):
+    writer.write('<interface name="{}">'.format(dbus_interface.name))
+    for member in dbus_interface._members:
+        if member[0] == 'method':
+            introspect_interface_method_writer(writer, member)
+        elif member[0] == 'signal':
+            introspect_interface_signal_writer(writer, member)
+        else:
+            raise TypeError('unhandled member type')
+    writer.write('</interface>')
+
+
+def introspect_object_writer(writer, dbus_object):
+    writer.write(DBUS_INTROSPECT_1_0_XML_DOCTYPE_DECL_NODE)
+    writer.write('<node>')
+    for interface in object_interfaces(dbus_object):
+        introspect_interface_writer(writer, interface)
+    for child_name in dbus_object.keys():
+        introspect_child_node_name_writer(writer, child_name)
+    writer.write('</node>')
+
+
+def introspect_object(dbus_object, prettify=False):
+    writer = StringIO()
+    introspect_object_writer(writer, dbus_object)
+    writer.seek(0)
+    xmlstr = writer.read()
+    if prettify:
+        xmlstr = xml.dom.minidom.parseString(xmlstr).toprettyxml()
+    return xmlstr
+
+
 def dbus_error_is_set(dbus_error):
     assert isinstance(dbus_error, DBusErrorStructure)
     return dbus.dbus_error_is_set(ctypes.pointer(dbus_error)) > 0
@@ -28,16 +196,14 @@ def dbus_error_is_set(dbus_error):
 def dbus_connection_open(dbus_addr):
     error = DBusErrorStructure()
     conn = dbus.dbus_connection_open(dbus_addr, ctypes.pointer(error))
-    if dbus.dbus_error_is_set(ctypes.pointer(error)) > 0:
-        raise DBusError(error)
+    error.raise_if_set()
     return conn.contents
 
 
 def dbus_connection_open_private(dbus_addr):
     error = DBusErrorStructure()
     conn = dbus.dbus_connection_open_private(dbus_addr, ctypes.pointer(error))
-    if dbus.dbus_error_is_set(ctypes.pointer(error)) > 0:
-        raise DBusError(error)
+    error.raise_if_set()
     return conn.contents
 
 
@@ -93,8 +259,7 @@ def dbus_bus_register(dbus_connection):
     response = dbus.dbus_bus_register(
         ctypes.pointer(dbus_connection),
         ctypes.pointer(error))
-    if dbus.dbus_error_is_set(ctypes.pointer(error)) > 0:
-        raise DBusError(error)
+    error.raise_if_set()
     return bool(response)
 
 
@@ -103,8 +268,7 @@ def dbus_bus_request_name(dbus_connection, name, flags):
     error = DBusErrorStructure()
     response = dbus.dbus_bus_request_name(
         ctypes.pointer(dbus_connection), name, flags, ctypes.pointer(error))
-    if dbus.dbus_error_is_set(ctypes.pointer(error)) > 0:
-        raise DBusError(error)
+    error.raise_if_set()
     return response
 
 
@@ -245,6 +409,17 @@ class DBusConnectionMethods(DelBase):
             return False
         if not hasattr(self, '_vtable'):
             self._vtable = dict()
+        self._vtable[path] = vtable
+
+    def try_register_fallback(self, path, vtable, user_data):
+        error = DBusErrorStructure()
+        dbus.dbus_connection_try_register_fallback(
+            ctypes.pointer(self),
+            path,
+            ctypes.pointer(vtable),
+            user_data,
+            ctypes.pointer(error))
+        error.raise_if_set()
         self._vtable[path] = vtable
 
     def get_socket(self):
@@ -436,26 +611,26 @@ class DBusConnectionStructure(ctypes.Structure):
 
 
 class DBusConnection(DBusConnectionMethods, DBusConnectionStructure):
+    SESSION = 1
+    SYSTEM = 2
     instances = weakref.WeakValueDictionary()
 
-    def __init__(self, *args, **kwargs):
-        instance = self.instances.get(ctypes.addressof(self), None)
-        if instance is None:
-            self.instances[ctypes.addressof(self)] = self
-        super(DBusConnection, self).__init__(*args, **kwargs)
+    def __new__(cls, bus, address=None, private=False):
+        if address is None and bus == cls.SESSION:
+            address = os.environ['DBUS_SESSION_BUS_ADDRESS']
+        if private:
+            inst = dbus_connection_open_private(address)
+        else:
+            inst = dbus_connection_open(address)
+        if ctypes.addressof(inst) not in cls.instances:
+            cls.instances[ctypes.addressof(inst)] = inst
+        return inst
+
+    def __init__(self, address, private=False):
+        self._vtable = {}
 
     def get_canonical(self):
         return self.instances[ctypes.addressof(self)]
-
-    @classmethod
-    def open(cls, address):
-        return dbus_connection_open(address)
-
-    @classmethod
-    def open_private(cls, address):
-        conn = dbus_connection_open_private(address)
-        DBusConnection.__init__(conn)
-        return conn
 
     def __repr__(self):
         return '{!s} @ {!s}>'.format(
@@ -513,11 +688,18 @@ class DBusErrorStructure(ctypes.Structure):
         ('padding1', ctypes.c_void_p)
     ]
 
+    def is_set(self):
+        return dbus.dbus_error_is_set(ctypes.pointer(self)) > 0
+
+    def raise_if_set(self):
+        if self.is_set():
+            raise DBusError(self)
+
 
 class DBusError(Exception):
-    def __init__(self, _dbus_exc):
-        super(DBusError, self).__init__(_dbus_exc.name, _dbus_exc.message)
-        self.original = _dbus_exc
+    def __init__(self, dbus_exc):
+        super(DBusError, self).__init__(dbus_exc.name, dbus_exc.message)
+        self.original = dbus_exc
 
 
 dbus.dbus_connection_ref.restype = \
