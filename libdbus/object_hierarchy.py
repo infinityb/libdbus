@@ -1,24 +1,10 @@
-from __future__ import print_function
-
-from gevent.select import select
-
-import libdbus
-from libdbus import DBusConnection
-
-
-connection = DBusConnection(DBusConnection.SESSION, private=True)
-
-
-libdbus.dbus_connection_get_server_id(connection)
-connection.bus_register()
-print("({!r}).bus_request_name(...) => {}".format(
-    connection,
-    connection.bus_request_name("org.yasashiisyndicate.dbusexample", 0)
-))
-
-frobulator_interface = \
-    libdbus.DBusInterface('org.yasashiisyndicate.Frobulator')
-frobulator_interface.add_method('Frobulate', 's', ['value'], 's')
+from __future__ import (
+    absolute_import,
+    division,
+    print_function,
+    unicode_literals
+)
+from . import dbus_bindings as libdbus
 
 
 def subpaths(path):
@@ -35,9 +21,9 @@ def subpaths(path):
     return slashs_at
 
 
-class xvtable(libdbus.DBusObjectPathVTable):
+class ObjectHierarchy(libdbus.DBusObjectPathVTable):
     def __init__(self, connection):
-        super(xvtable, self).__init__()
+        super(ObjectHierarchy, self).__init__()
         self._connection = connection.get_canonical()
         self._interfaces = {}
         self._object_table = {}
@@ -107,32 +93,6 @@ class xvtable(libdbus.DBusObjectPathVTable):
         if len(argspec) == 1:
             new_msg.append_args([(argspec[0], retval)])
         else:
-            new_msg.append_args(zip(argspec, retval))
+            new_msg.append_object(argspec, retval)
         conn.send(new_msg)
         return libdbus.DBUS_HANDLER_RESULT_HANDLED
-
-
-class OrderRemovalFrobulator(
-    frobulator_interface.astype(),
-    libdbus.DBusObject
-):
-    @libdbus.export
-    def Frobulate(self, value):
-        return ''.join(sorted(value))
-
-
-object_table = xvtable(connection)
-frobulator = OrderRemovalFrobulator()
-frobulator['foo'] = frobulator
-object_table.register_object_hierarchy('/', frobulator)
-
-
-connection.quacking = True
-
-while connection.quacking:
-    (rs, ws, xs) = select([connection], [], [])
-    if connection in rs:
-        libdbus.dbus_connection_read_write_dispatch(connection, 0)
-        connection.dispatch()
-
-connection.close()
