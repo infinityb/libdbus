@@ -63,18 +63,26 @@ class GeneralTest(unittest.TestCase):
         with DBusConnection('session', private=True) as cli:
             proxy_object = cli.get_object(
                 "org.yasashiisyndicate.dbusexample",
-                "/org/yasashiisyndicate/dbusexample")
-            response = proxy_object.dbus_call('Frobulate', 'Frobulation Test')
+                "/org/yasashiisyndicate/dbusexample",
+                interface=frobulator_interface)
+            response_fut = proxy_object.dbus_call(
+                'Frobulate', 'Frobulation Test')
+            try:
+                response = response_fut.get(timeout=1)
+            except:
+                import pdb; pdb.set_trace()
+                raise
             self.assertEqual(response, ' FTabeilnoorsttu')
 
     def test_unbifrobulator(self):
         with DBusConnection('session', private=True) as cli:
             proxy_object = cli.get_object(
                 "org.yasashiisyndicate.dbusexample",
-                "/org/yasashiisyndicate/dbusexample")
+                "/org/yasashiisyndicate/dbusexample",
+                interface=frobulator_interface)
             test_object = {'a': 1, 'b': 2}
             response = proxy_object.dbus_call(
-                'Unbifrobulate', repr(test_object))
+                'Unbifrobulate', repr(test_object)).get(timeout=1)
             self.assertEqual(response, test_object)
             gevent.sleep(100)
 

@@ -4,9 +4,13 @@ from __future__ import (
     print_function,
     unicode_literals
 )
-from .dbus_bindings import dbus_connection_read_write_dispatch
+from .dbus_bindings import (
+    dbus_connection_read_write_dispatch,
+    DBusPendingCallStructure
+)
 import gevent
 from gevent.select import select
+from gevent.event import AsyncResult
 
 
 def start_dispatch_loop_greenlet(connection):
@@ -26,3 +30,8 @@ def start_dispatch_loop_greenlet(connection):
 def start_dispatch_loop(connection):
     return gevent.Greenlet.spawn(
         start_dispatch_loop_greenlet, connection)
+
+
+class DBusPendingCall(DBusPendingCallStructure, AsyncResult):
+    pass
+

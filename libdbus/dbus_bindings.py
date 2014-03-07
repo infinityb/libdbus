@@ -6,14 +6,14 @@ from __future__ import (
 )
 
 import os
-import weakref
 import ctypes
 from cStringIO import StringIO
 import xml.dom.minidom
+from weakref import WeakValueDictionary
+from gevent.event import AsyncResult
 
 
 dbus = ctypes.CDLL('libdbus-1.so.3')
-
 
 DBUS_TYPE_INVALID = 0
 
@@ -24,6 +24,9 @@ DBUS_DISPATCH_NEED_MEMORY = 2
 DBUS_HANDLER_RESULT_HANDLED = 0
 DBUS_HANDLER_RESULT_NOT_YET_HANDLED = 1
 DBUS_HANDLER_RESULT_NEED_MEMORY = 2
+DBUS_TIMEOUT_INFINITE = 0x7FFFFFFF
+DBUS_TIMEOUT_USE_DEFAULT = -1
+
 
 DBUS_INTROSPECT_1_0_XML_DOCTYPE_DECL_NODE = \
     '<!DOCTYPE node PUBLIC ' \
@@ -368,9 +371,9 @@ def dbus_connection_pop_message(dbus_connection):
     assert isinstance(dbus_connection, DBusConnectionStructure)
     message = dbus.dbus_connection_pop_message(
         ctypes.pointer(dbus_connection))
-    if message.content is None:
+    if message.contents is None:
         raise IndexError("Empty Queue")
-    return message.context
+    return message.contents
 
 
 def dbus_connection_return_message(dbus_connection, message):
@@ -408,20 +411,38 @@ class DelBase(object):
 
 
 class DBusProxyObject(object):
+    @classmethod
+    def pytype_to_argspec(cls, pytype):
+        if isinstance(pytype, str):
+            return 's'
+        raise NotImplemented
+
     def __init__(self, connection, service, path, interface=0):
         self._connection = connection
         self._service = service
         self._path = path
+        if isinstance(interface, DBusInterface):
+            interface = interface.name
         self._interface = interface
 
     def dbus_call(self, method_name, *args, **kwargs):
         message = DBusMessage.new_method_call(
             self._service, self._path,
             self._interface, method_name)
-        self._connection.send(message)
+        message_iterator = message.get_iterator_for_writing()
+        for arg in args:
+            message_iterator.append(
+                self.pytype_to_argspec(arg), arg)
+        response_future = self._connection.send_with_reply(message)
+        return response_future
 
 
 class DBusConnectionMethods(DelBase):
+    def __init__(self, *args, **kwargs):
+        super(DBusConnectionMethods, self).__init__(*args, **kwargs)
+        self._vtable = {}
+        self._pending_futures = WeakValueDictionary()
+
     def fileno(self):
         if not self.is_connected():
             raise ValueError('I/O operation on closed session')
@@ -504,8 +525,14 @@ class DBusConnectionMethods(DelBase):
             raise Exception()
         return out.value
 
-    def get_object(self, service, path):
-        return DBusProxyObject(self, service, path)
+    def send_with_reply(self, message, timeout=DBUS_TIMEOUT_USE_DEFAULT):
+        serial = self.send(message)
+        future = AsyncResult()
+        self._pending_futures[serial] = future
+        return future
+
+    def get_object(self, service, path, interface=None):
+        return DBusProxyObject(self, service, path, interface=interface)
 
     def __enter__(self):
         self.get_server_id()
@@ -625,7 +652,9 @@ class DBusMessageIterMethods(object):
 
     def append_basic(self, type_, value):
         success = bool(dbus.dbus_message_iter_append_basic(
-            ctypes.pointer(self), ord(type_), ctypes.pointer(value)
+            ctypes.pointer(self),
+            ord(type_),
+            ctypes.pointer(value)
         ))
         if not success:
             raise MemoryError()
@@ -639,7 +668,7 @@ class DBusMessageIterMethods(object):
         if _headest(type_) in 's':
             return self.append_basic(type_, ctypes.pointer(
                 ctypes.create_string_buffer(value.encode('utf8'))))
-        elif _headest(type_) == 'a':
+        elif _headest(type_) == 'a' and contained_signature is not None:
             sub = DBusMessageIter()
             dbus.dbus_message_iter_open_container(
                 ctypes.pointer(self), ord('a'), ''.join(contained_signature),
@@ -670,6 +699,7 @@ class DBusMessageIter(DBusMessageIterStructure, DBusMessageIterMethods):
 
 
 class DBusMessageMethods(DelBase):
+
     def get_interface(self):
         return dbus.dbus_message_get_interface(
             ctypes.pointer(self))
@@ -681,6 +711,11 @@ class DBusMessageMethods(DelBase):
     def get_path(self):
         return dbus.dbus_message_get_path(
             ctypes.pointer(self))
+
+    def get_reply_serial(self):
+        serial = dbus.dbus_message_get_reply_serial(
+            ctypes.pointer(self))
+        return None if serial == 0 else serial
 
     def new_method_return(self):
         return dbus.dbus_message_new_method_return(
@@ -715,12 +750,22 @@ class DBusMessageMethods(DelBase):
         yield 'member', self.get_member()
         yield 'path', self.get_path()
 
-    def iter_args(self):
+    def get_iterator(self):
         miter = DBusMessageIter()
         dbus.dbus_message_iter_init(
             ctypes.pointer(self),
             ctypes.pointer(miter))
-        return iter(miter)
+        return miter
+
+    def iter_args(self):
+        return iter(self.get_iterator())
+
+    def get_iterator_for_writing(self):
+        miter = DBusMessageIter()
+        dbus.dbus_message_iter_init_append(
+            ctypes.pointer(self),
+            ctypes.pointer(miter))
+        return miter
 
 
 class DBusMessage(DBusMessageStructure, DBusMessageMethods):
@@ -757,7 +802,7 @@ class DBusConnectionStructure(ctypes.Structure):
 class DBusConnection(DBusConnectionMethods, DBusConnectionStructure):
     SESSION = 1
     SYSTEM = 2
-    instances = weakref.WeakValueDictionary()
+    instances = WeakValueDictionary()
 
     def __new__(cls, bus, address=None, private=False):
         if bus == 'session':
@@ -775,7 +820,7 @@ class DBusConnection(DBusConnectionMethods, DBusConnectionStructure):
         return inst
 
     def __init__(self, address, private=False):
-        self._vtable = {}
+        super(DBusConnection, self).__init__()
 
     def get_canonical(self):
         return self.instances[ctypes.addressof(self)]
@@ -842,6 +887,50 @@ class DBusErrorStructure(ctypes.Structure):
     def raise_if_set(self):
         if self.is_set():
             raise DBusError(self)
+
+
+class DBusPendingCallStructure(ctypes.Structure):
+    _fields_ = []
+
+
+class DBusPendingCallMethods(object):
+    pass
+
+
+class DBusPendingCall(DBusPendingCallStructure, DBusPendingCallMethods):
+    pass
+
+
+class CoolDBusPendingCall(DBusPendingCall):
+    def __init__(self, connection):
+        self._message = None
+        self.connection = connection
+        self.connection.add_pending_call(self)
+        success = bool(dbus.dbus_pending_call_set_notify(
+            ctypes.pointer(self),
+            DBusObjectPathMessageFunction(
+                self.handle_notify)))
+        if not success:
+            raise MemoryError()
+
+    def handle_notify(self, user_data):
+        self.connection.remove_pending_call(self)
+        assert bool(dbus.dbus_pending_call_get_completed(
+            ctypes.pointer(self)))
+        dbus.dbus_pending_call_steal_reply.restype = \
+            ctypes.POINTER(DBusMessage)
+        message = dbus.dbus_pending_call_steal_reply(
+            ctypes.pointer(self)).contents
+        message._allocated = True
+        self._message = message
+
+    def __del__(self):
+        if hasattr(self, '_allocated') and self._allocated:
+            dbus.dbus_pending_call_unref(ctypes.pointer(self))
+
+
+DBusPendingCallNotifyFunction = \
+    ctypes.CFUNCTYPE(ctypes.POINTER(DBusPendingCall), ctypes.c_void_p)
 
 
 class DBusError(Exception):

@@ -67,7 +67,6 @@ class ObjectHierarchy(libdbus.DBusObjectPathVTable):
                 break
         else:
             raise Exception()
-
         interface_obj = self._interfaces[msg.get_interface()]
         by_interface = self._object_table.get(path, None)
         if by_interface is None:
